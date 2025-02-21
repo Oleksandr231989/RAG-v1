@@ -10,7 +10,6 @@ import logging
 import sys
 from typing import List, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential
-import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,9 +21,6 @@ if "OPENAI_API_KEY" in st.secrets:
 else:
     st.error("Missing OpenAI API Key! Please add it to Streamlit Secrets.")
     st.stop()
-
-# Define file path for local dataset
-FILE_PATH = "C:/Users/o.polosmak/OneDrive - BIOCODEX/RAG/RAG DB.xlsx"
 
 # Initialize session state
 if 'initialized' not in st.session_state:
@@ -139,10 +135,12 @@ def query_faiss(user_query: str, index, texts: List[str], embedding_model) -> st
 # Streamlit UI
 try:
     st.title("Sales Data Analysis Assistant")
+
+    # File upload
+    uploaded_file = st.file_uploader("Upload your Excel file", type=['xlsx'])
     
-    # Load local Excel file
-    if os.path.exists(FILE_PATH):
-        df = pd.read_excel(FILE_PATH)
+    if uploaded_file is not None:
+        df = pd.read_excel(uploaded_file)
         
         # Initialize FAISS index if not already done
         if not st.session_state.initialized:
@@ -161,8 +159,9 @@ try:
                     st.session_state.embedding_model
                 )
                 st.write(response)
+    
     else:
-        st.error("Data file not found. Please check the path: C:/Users/o.polosmak/OneDrive - BIOCODEX/RAG/RAG DB.xlsx")
+        st.warning("Please upload an Excel file to proceed.")
 
 except Exception as e:
     logger.error(f"Application error: {str(e)}")

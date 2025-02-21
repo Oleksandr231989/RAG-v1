@@ -3,10 +3,11 @@ import pandas as pd
 import openai
 import faiss
 import numpy as np
-import os
-import logging
-from langchain_openai import OpenAIEmbeddings
+import time
+from langchain.embeddings import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import logging
+import sys
 from typing import List, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -14,64 +15,100 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Set OpenAI API key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Initialize session state
+if 'initialized' not in st.session_state:
+    st.session_state.initialized = False
 
-# Column Descriptions for Improved Context
-COLUMN_DESCRIPTIONS = {
-    "Country": "name of the country",
-    "Date": "date in the format date by months",
-    "Competitive market": "main category/group/market",
-    "Submarket 1": "subcategory for competitive market",
-    "Submarket 2": "subcategory 2 for competitive market",
-    "Sales (local currency)": "total sales in local currency",
-    "Sales (Euro)": "total sales in Euro",
-    "Brand": "the name of the brand",
-    "Product": "SKU or product name",
-    "Corporation": "company, corporation, manufacturer name"
-}
+# Error handling decorator
+def handle_errors(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {str(e)}")
+            st.error(f"An error occurred: {str(e)}")
+            return None
+    return wrapper
 
-# Load Excel file directly in the code (Replace with actual file path)
-FILE_PATH = "data/sales_data.xlsx"
-df = pd.read_excel(FILE_PATH)
+@retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
+@handle_errors
+def get_embeddings(texts: List[str], embedding_model) -> List[List[float]]:
+    """Get embeddings with retry logic and error handling"""
+    return embedding_model.embed_documents(texts)
 
-# Function to create embeddings and store in FAISS
-@st.cache_resource(ttl=3600)
+@st.cache_resource(ttl=3600)  # Cache for 1 hour
+@handle_errors
 def create_faiss_index(df: pd.DataFrame) -> Tuple[faiss.Index, List[str], OpenAIEmbeddings]:
+    """Create FAISS index with improved error handling and caching"""
     try:
-        embedding_model = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai.api_key)
-        
-        texts = [" | ".join(f"{col}: {row[col]}" for col in df.columns) for _, row in df.iterrows()]
-        
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100, separators=["\n", " | ", ". ", " ", ""])
+        # Initialize embedding model
+        embedding_model = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=st.secrets["OPENAI_API_KEY"]
+        )
+
+        # Convert dataframe to text
+        texts = []
+        for _, row in df.iterrows():
+            formatted_row = row.copy()
+            for col in row.index:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    formatted_row[col] = f"{row[col]:,.2f}"
+            
+            text = " | ".join(f"{col}: {formatted_row[col]}" for col in df.columns)
+            texts.append(text)
+
+        # Create chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100,
+            separators=["\n", " | ", ". ", " ", ""]
+        )
         chunks = text_splitter.create_documents(texts)
         chunk_texts = [doc.page_content for doc in chunks]
 
-        batch_size = 25
+        # Process embeddings in smaller batches
         embeddings = []
-        for i in range(0, len(chunk_texts), batch_size):
-            batch = chunk_texts[i:i + batch_size]
-            embeddings.extend(embedding_model.embed_documents(batch))
+        batch_size = 25  # Reduced batch size
         
+        with st.spinner("Processing data... This may take a few minutes."):
+            for i in range(0, len(chunk_texts), batch_size):
+                batch = chunk_texts[i:i + batch_size]
+                batch_embeddings = get_embeddings(batch, embedding_model)
+                embeddings.extend(batch_embeddings)
+                time.sleep(0.1)  # Rate limiting
+                
+                # Update progress
+                progress = (i + batch_size) / len(chunk_texts)
+                st.progress(min(progress, 1.0))
+
+        # Create FAISS index
         dimension = len(embeddings[0])
         index = faiss.IndexFlatL2(dimension)
         index.add(np.array(embeddings, dtype=np.float32))
-        
+
         return index, chunk_texts, embedding_model
+
     except Exception as e:
         logger.error(f"Error creating FAISS index: {str(e)}")
+        st.error("Failed to initialize the search index. Please try again.")
         raise
 
-index, texts, embedding_model = create_faiss_index(df)
-
-@retry(wait=wait_exponential(min=1, max=60), stop=stop_after_attempt(3))
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def query_faiss(user_query: str, index, texts: List[str], embedding_model) -> str:
+    """Query FAISS index with improved error handling"""
     try:
+        # Generate query embedding
         query_embedding = embedding_model.embed_query(user_query)
+        
+        # Search index
         k = 3
         _, indices = index.search(np.array([query_embedding], dtype=np.float32), k)
+        
+        # Get context
         context = "\n".join([texts[i] for i in indices[0]])
         
+        # Generate response
         response = openai.ChatCompletion.create(
             model="gpt-4-turbo",
             messages=[
@@ -83,12 +120,40 @@ def query_faiss(user_query: str, index, texts: List[str], embedding_model) -> st
         )
         
         return response.choices[0].message.content
+
     except Exception as e:
         logger.error(f"Error querying FAISS: {str(e)}")
         return f"Error processing query: {str(e)}"
 
-st.title("Sales Data Analysis Assistant")
-user_query = st.text_input("What would you like to know about the sales data?")
-if user_query:
-    response = query_faiss(user_query, index, texts, embedding_model)
-    st.write(response)
+# Streamlit UI
+try:
+    st.title("Sales Data Analysis Assistant")
+    
+    # File upload
+    uploaded_file = st.file_uploader("Upload your Excel file", type=['xlsx'])
+    
+    if uploaded_file:
+        # Load data
+        df = pd.read_excel(uploaded_file)
+        
+        # Initialize FAISS index if not already done
+        if not st.session_state.initialized:
+            with st.spinner("Initializing AI model..."):
+                st.session_state.index, st.session_state.texts, st.session_state.embedding_model = create_faiss_index(df)
+                st.session_state.initialized = True
+        
+        # Query interface
+        user_query = st.text_input("What would you like to know about the sales data?")
+        if user_query:
+            with st.spinner("Analyzing data..."):
+                response = query_faiss(
+                    user_query,
+                    st.session_state.index,
+                    st.session_state.texts,
+                    st.session_state.embedding_model
+                )
+                st.write(response)
+
+except Exception as e:
+    logger.error(f"Application error: {str(e)}")
+    st.error("An unexpected error occurred. Please refresh the page and try again.")

@@ -4,8 +4,4 @@ openai
 faiss-cpu
 numpy
 langchain
-langchain-community
-langchain-openai
-openpyxl
 tenacity
-logging
